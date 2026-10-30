@@ -821,6 +821,7 @@
     var LS_KEY = "sunday-basket-v1";
     var COLLS = ["meals", "staples", "pantry", "plan", "items", "adjust", "snacks", "picks"];
     var db = null;
+    var api = false;
     var cache = {};
     var listeners = [];
     COLLS.forEach(function (c) { cache[c] = {}; });
@@ -877,6 +878,12 @@
             if (e && (e.code === "invalid_argument" || e.code === "revoked")) Store.readOnly = true;
             emit();
           });
+        } else if (api) {
+          fetch("/api/" + coll + "/" + encodeURIComponent(id), {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body)
+          }).catch(function (e) { console.warn("save failed", coll, id, e); });
         } else {
           lsSave();
         }
@@ -885,19 +892,29 @@
       del: function (coll, id) {
         if (cache[coll]) delete cache[coll][id];
         emit();
-        if (db) db.collection(coll).doc(id).delete().catch(function (e) { console.warn("delete failed", e && e.code); });
-        else lsSave();
+        if (db) {
+          db.collection(coll).doc(id).delete().catch(function (e) { console.warn("delete failed", e && e.code); });
+        } else if (api) {
+          fetch("/api/" + coll + "/" + encodeURIComponent(id), { method: "DELETE" })
+            .catch(function (e) { console.warn("delete failed", e); });
+        } else {
+          lsSave();
+        }
       },
 
       readOnly: false,
       shared: false,
 
-      /* Renders immediately from localStorage, then upgrades to the shared
-         store if this viewer has one. */
+      /* Renders immediately from whatever is cached locally, then upgrades to
+         a shared store if one is reachable: the Artifact database when running
+         inside Claude, otherwise this app's own server. Falling through to
+         localStorage keeps the file working opened straight off disk. */
       init: function (done) {
         loadLocal();
         done();
-        if (!window.claude || !window.claude.use) return;
+
+        if (!window.claude || !window.claude.use) return connectServer();
+
         window.claude.use("db").then(function (handle) {
           if (!handle) return;
           db = handle;
@@ -913,9 +930,48 @@
             });
           });
           emit();
-        }).catch(function () { /* stay on localStorage */ });
+        }).catch(connectServer);
       }
     };
+
+    /* Self-hosted: one fetch for everything, then an event stream so the other
+       phone's edits arrive without polling. */
+    function connectServer() {
+      if (!window.fetch || location.protocol === "file:") return;
+
+      fetch("/api/state", { headers: { accept: "application/json" } })
+        .then(function (r) {
+          if (!r.ok) throw new Error("no server");
+          return r.json();
+        })
+        .then(function (data) {
+          api = true;
+          Store.shared = true;
+          COLLS.forEach(function (c) { cache[c] = data[c] || {}; });
+          emit();
+          subscribe();
+        })
+        .catch(function () { /* no server here: localStorage it is */ });
+    }
+
+    function subscribe() {
+      if (!window.EventSource) return;
+      var src = new EventSource("/api/events");
+      src.onmessage = function (e) {
+        var msg;
+        try { msg = JSON.parse(e.data); } catch (err) { return; }
+        if (!msg || COLLS.indexOf(msg.coll) < 0) return;
+        if (msg.type === "put") cache[msg.coll][msg.id] = msg.doc;
+        else if (msg.type === "del") delete cache[msg.coll][msg.id];
+        else return;
+        emit();
+      };
+      /* EventSource reconnects on its own; re-sync in case edits were missed
+         while the connection was down. */
+      src.onerror = function () {
+        if (src.readyState === EventSource.CLOSED) setTimeout(connectServer, 3000);
+      };
+    }
   })();
 
   /* ============================ app state ============================ */

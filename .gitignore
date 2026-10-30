@@ -1,5 +1,6 @@
 node_modules/
+server/data.json
+server/data.json.tmp
 *.sqlite
-*.sqlite-journal
 .env
 .DS_Store
